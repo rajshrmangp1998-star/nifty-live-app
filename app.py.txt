@@ -1,0 +1,281 @@
+import os
+import time
+import math
+import requests
+from datetime import datetime, timedelta
+import pandas as pd
+import streamlit as st
+import pyotp
+from SmartApi import SmartConnect
+
+# ================= PAGE CONFIG (MOBILE FRIENDLY) =================
+st.set_page_config(
+    page_title="Nifty Live Option Chain Pro",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Custom CSS for Institutional Red/Green Matrix Look
+st.markdown("""
+<style>
+    .block-container { padding-top: 1rem; padding-bottom: 1rem; padding-left: 0.5rem; padding-right: 0.5rem; }
+    .decision-box { padding: 15px; border-radius: 10px; text-align: center; font-weight: bold; margin-bottom: 12px; color: #000; }
+    .bullish { background-color: #00cc66; border: 2px solid #008040; }
+    .bearish { background-color: #ff6666; border: 2px solid #b30000; color: #fff; }
+    .neutral { background-color: #ffeb9c; border: 2px solid #cc9900; }
+    .metric-card { background-color: #0f243e; color: white; padding: 10px; border-radius: 8px; text-align: center; }
+    .stDataFrame { font-size: 12px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ================= CREDENTIALS (FROM STREAMLIT SECRETS OR ENV) =================
+API_KEY = st.secrets.get("API_KEY", "voT6BGPU")
+CLIENT_CODE = st.secrets.get("CLIENT_CODE", "AAAA317311")
+PASSWORD = st.secrets.get("PASSWORD", "7047")
+TOTP_SECRET = st.secrets.get("TOTP_SECRET", "IW4DZWTJ2CAMBGMP2A7WOTLRNI")
+
+# ================= BLACK-SCHOLES IV & DELTA =================
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_price(S, K, T, r, sigma, opt_type):
+    if T <= 0 or sigma <= 0:
+        return max(0.0, S - K) if opt_type == "CE" else max(0.0, K - S)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return (S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)) if opt_type == "CE" else (K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1))
+
+def calc_iv_and_delta(S, K, T_days, market_price, opt_type):
+    T = max(T_days, 0.25) / 365.0
+    r = 0.07
+    if market_price <= 0.5:
+        return 0.0, (1.0 if (opt_type == "CE" and S > K) else (-1.0 if (opt_type == "PE" and S < K) else 0.0))
+    low, high, iv = 0.01, 3.0, 0.15
+    for _ in range(20):
+        iv = (low + high) / 2.0
+        if bs_price(S, K, T, r, iv, opt_type) > market_price:
+            high = iv
+        else:
+            low = iv
+    d1 = (math.log(S / K) + (r + 0.5 * iv ** 2) * T) / (iv * math.sqrt(T))
+    delta = norm_cdf(d1) if opt_type == "CE" else (norm_cdf(d1) - 1.0)
+    return round(iv * 100, 1), round(delta, 2)
+
+# ================= CACHED SESSION & MASTER DATA =================
+@st.cache_resource(ttl=14400) # 4 hours session cache
+def get_smartapi_session():
+    smartApi = SmartConnect(API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    session = smartApi.generateSession(CLIENT_CODE, PASSWORD, totp)
+    if session.get("status"):
+        return smartApi
+    return None
+
+@st.cache_data(ttl=86400) # 1 day master cache
+def get_nifty_option_master():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    df = pd.DataFrame(requests.get(url, timeout=20).json())
+    nifty_opts = df[(df['name'] == 'NIFTY') & (df['instrumenttype'] == 'OPTIDX')].copy()
+    nifty_opts['expiry_dt'] = pd.to_datetime(nifty_opts['expiry'], format='%d%b%Y')
+    today = pd.Timestamp.today().normalize()
+    nearest_expiry = nifty_opts[nifty_opts['expiry_dt'] >= today]['expiry_dt'].min()
+    current_opts = nifty_opts[nifty_opts['expiry_dt'] == nearest_expiry].copy()
+    current_opts['strike_price'] = (current_opts['strike'].astype(float) / 100.0).astype(int)
+    days_to_exp = max(1, (nearest_expiry - today).days)
+    return current_opts, nearest_expiry.strftime('%d-%b-%Y'), days_to_exp
+
+def calculate_max_pain(strikes, ce_oi_map, pe_oi_map):
+    min_pain = float("inf")
+    max_pain_strike = strikes[len(strikes) // 2]
+    for exp_price in strikes:
+        pain = sum(((exp_price - k) * ce_oi_map.get(k, 0)) if exp_price > k else ((k - exp_price) * pe_oi_map.get(k, 0)) for k in strikes)
+        if pain < min_pain:
+            min_pain = pain
+            max_pain_strike = exp_price
+    return max_pain_strike
+
+# ================= MAIN LIVE APP =================
+def main():
+    st.title("📈 Nifty 50 Live Option Chain Pro")
+
+    # Auto-refresh toggle for mobile
+    col_t1, col_t2 = st.columns([2, 1])
+    with col_t1:
+        auto_refresh = st.toggle("🔄 Auto-Refresh Live Data (Har 5 Sec)", value=True)
+    with col_t2:
+        if st.button("Refresh Now"):
+            st.rerun()
+
+    smartApi = get_smartapi_session()
+    if not smartApi:
+        st.error("Angel One Login Failed! Secrets me API Key / PIN / TOTP check karein.")
+        return
+
+    opts_df, expiry_str, days_to_exp = get_nifty_option_master()
+
+    # Fetch Spot Price
+    spot_res = smartApi.ltpData("NSE", "Nifty 50", "99926000")
+    if not spot_res.get("status"):
+        st.warning("Spot data fetch retry ho raha hai...")
+        time.sleep(2)
+        st.rerun()
+
+    spot_ltp = float(spot_res["data"]["ltp"])
+    atm_strike = round(spot_ltp / 50) * 50
+    strikes = [atm_strike + (i * 50) for i in range(-8, 9)] # 17 Strikes (Clean Mobile View)
+
+    sub = opts_df[opts_df['strike_price'].isin(strikes)]
+    tokens = sub['token'].tolist()
+    token_map = dict(zip(sub['token'], zip(sub['strike_price'], sub['symbol'])))
+
+    mkt_res = smartApi.getMarketData("FULL", {"NFO": tokens})
+    if not mkt_res.get("status"):
+        st.warning("Option Chain fetch retry ho raha hai...")
+        time.sleep(2)
+        st.rerun()
+
+    fetched = mkt_res["data"].get("fetched", [])
+    chain = {k: {"CE": {}, "PE": {}} for k in strikes}
+
+    for item in fetched:
+        tok = item.get("symbolToken")
+        if tok not in token_map:
+            continue
+        k, sym = token_map[tok]
+        side = "CE" if sym.endswith("CE") else "PE"
+        chain[k][side] = {
+            "ltp": float(item.get("ltp", 0)),
+            "chg": float(item.get("netChange", 0)),
+            "oi": int(item.get("opnInterest", 0)),
+            "vol": int(item.get("tradeVolume", 0))
+        }
+
+    ce_ois = {k: chain[k]["CE"].get("oi", 0) for k in strikes}
+    pe_ois = {k: chain[k]["PE"].get("oi", 0) for k in strikes}
+    max_ce_oi_k = max(ce_ois, key=ce_ois.get)
+    max_pe_oi_k = max(pe_ois, key=pe_ois.get)
+
+    major_eor = round(max_ce_oi_k + chain[max_ce_oi_k]["CE"].get("ltp", 0), 1)
+    major_eos = round(max_pe_oi_k - chain[max_pe_oi_k]["PE"].get("ltp", 0), 1)
+    max_pain_k = calculate_max_pain(strikes, ce_ois, pe_ois)
+
+    tot_ce_oi, tot_pe_oi = sum(ce_ois.values()), sum(pe_ois.values())
+    pcr_val = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 1.0
+
+    # ================= DIRECTION & TRADE ACTION LOGIC =================
+    dist_to_eos = abs(spot_ltp - major_eos)
+    dist_to_eor = abs(major_eor - spot_ltp)
+
+    if pcr_val >= 1.05 or dist_to_eos < dist_to_eor:
+        box_class = "bullish"
+        dir_title = "🟢 MARKET UPAR JAYEGA (BULLISH BIAS)"
+        rec_ltp = chain[atm_strike]["CE"].get("ltp", 0)
+        _, rec_delta = calc_iv_and_delta(spot_ltp, atm_strike, days_to_exp, rec_ltp, "CE")
+        d = max(abs(rec_delta), 0.45)
+        tgt = round(rec_ltp + (max(major_eor - spot_ltp, 40) * d), 1)
+        sl = round(max(rec_ltp - (30 * d), rec_ltp * 0.70), 1)
+        action_msg = f"BUY {atm_strike} CE @ ₹{rec_ltp}  |  SL: ₹{sl}  |  TARGET: ₹{tgt}"
+        range_msg = f"Target Limit: {major_eor} (EOR) | Strong Floor: {major_eos} (EOS)"
+    elif pcr_val <= 0.85 or dist_to_eor < dist_to_eos:
+        box_class = "bearish"
+        dir_title = "🔴 MARKET NEECHE JAYEGA (BEARISH BIAS)"
+        rec_ltp = chain[atm_strike]["PE"].get("ltp", 0)
+        _, rec_delta = calc_iv_and_delta(spot_ltp, atm_strike, days_to_exp, rec_ltp, "PE")
+        d = max(abs(rec_delta), 0.45)
+        tgt = round(rec_ltp + (max(spot_ltp - major_eos, 40) * d), 1)
+        sl = round(max(rec_ltp - (30 * d), rec_ltp * 0.70), 1)
+        action_msg = f"BUY {atm_strike} PE @ ₹{rec_ltp}  |  SL: ₹{sl}  |  TARGET: ₹{tgt}"
+        range_msg = f"Target Limit: {major_eos} (EOS) | Strong Ceiling: {major_eor} (EOR)"
+    else:
+        box_class = "neutral"
+        dir_title = "🟡 SIDEWAYS / RANGE BOUND MARKET"
+        action_msg = f"WAIT FOR BREAKOUT ABOVE {major_eor} OR BELOW {major_eos}"
+        range_msg = f"Trading Range: {major_eos} se {major_eor}"
+
+    # Render Decision Board
+    st.markdown(f"""
+    <div class="decision-box {box_class}">
+        <div style="font-size: 18px;">{dir_title}</div>
+        <div style="font-size: 16px; margin-top: 6px;">{action_msg}</div>
+        <div style="font-size: 13px; margin-top: 4px; opacity: 0.9;">{range_msg}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Top Key Metrics Row
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Nifty Spot", f"{spot_ltp}")
+    m2.metric("PCR (OI)", f"{pcr_val}")
+    m3.metric("Resistance (EOR)", f"{max_ce_oi_k} ({major_eor})")
+    m4.metric("Support (EOS)", f"{max_pe_oi_k} ({major_eos})")
+    m5.metric("Max Pain", f"{max_pain_k} ({expiry_str})")
+
+    # ================= BUILD OPTION CHAIN MATRIX TABLE =================
+    table_rows = []
+    for k in strikes:
+        ce, pe = chain[k]["CE"], chain[k]["PE"]
+        ce_ltp, ce_oi, ce_vol = ce.get("ltp", 0), ce.get("oi", 0), ce.get("vol", 0)
+        pe_ltp, pe_oi, pe_vol = pe.get("ltp", 0), pe.get("oi", 0), pe.get("vol", 0)
+
+        ce_iv, ce_d = calc_iv_and_delta(spot_ltp, k, days_to_exp, ce_ltp, "CE")
+        pe_iv, pe_d = calc_iv_and_delta(spot_ltp, k, days_to_exp, pe_ltp, "PE")
+        d_ce, d_pe = max(abs(ce_d), 0.20), max(abs(pe_d), 0.20)
+
+        table_rows.append({
+            "CE IV|Δ": f"{ce_iv}|{ce_d}",
+            "CE OI": ce_oi,
+            "CE Vol": ce_vol,
+            "CE SL": round(max(ce_ltp - 30 * d_ce, ce_ltp * 0.70), 1),
+            "CE Tgt": round(ce_ltp + max(major_eor - spot_ltp, 35) * d_ce, 1),
+            "CE LTP": ce_ltp,
+            "EOR": round(k + ce_ltp, 1),
+            "STRIKE": f"👉 {k}" if k == atm_strike else f"{k}",
+            "EOS": round(k - pe_ltp, 1),
+            "PE LTP": pe_ltp,
+            "PE Tgt": round(pe_ltp + max(spot_ltp - major_eos, 35) * d_pe, 1),
+            "PE SL": round(max(pe_ltp - 30 * d_pe, pe_ltp * 0.70), 1),
+            "PE Vol": pe_vol,
+            "PE OI": pe_oi,
+            "PE IV|Δ": f"{pe_iv}|{pe_d}"
+        })
+
+    df_chain = pd.DataFrame(table_rows)
+
+    def highlight_matrix(row):
+        styles = [''] * len(row)
+        strike_num = int(str(row["STRIKE"]).replace("👉 ", ""))
+        
+        # Strike Column Dark Blue
+        styles[7] = 'background-color: #0f243e; color: white; font-weight: bold;'
+        # Spot ATM Row Highlight
+        if strike_num == atm_strike:
+            styles = ['background-color: #fff200; color: black; font-weight: bold;'] * len(row)
+            styles[7] = 'background-color: #000000; color: #fff200; font-weight: bold;'
+        else:
+            # ITM Shading
+            if strike_num < spot_ltp:
+                styles[5] = 'background-color: #ffcccc; color: black;' # ITM Call
+            else:
+                styles[9] = 'background-color: #ccffcc; color: black;' # ITM Put
+            # Max OI Highlights
+            if strike_num == max_ce_oi_k:
+                styles[1] = 'background-color: #ffe600; color: black; font-weight: bold;'
+            if strike_num == max_pe_oi_k:
+                styles[13] = 'background-color: #00e673; color: black; font-weight: bold;'
+        return styles
+
+    st.dataframe(
+        df_chain.style.apply(highlight_matrix, axis=1),
+        use_container_width=True,
+        height=640,
+        hide_index=True
+    )
+
+    st.caption(f"Last Updated: {datetime.now().strftime('%H:%M:%S')} IST | Auto-refresh active")
+
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+
+if __name__ == "__main__":
+    main()
