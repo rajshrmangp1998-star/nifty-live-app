@@ -32,6 +32,10 @@ CLIENT_CODE = st.secrets.get("CLIENT_CODE", "AAAA317311")
 PASSWORD = st.secrets.get("PASSWORD", "7047")
 TOTP_SECRET = st.secrets.get("TOTP_SECRET", "IW4DZWTJ2CAMBGMP2A7WOTLRNI")
 
+# Session State for Locked Trade (Taaki Entry Bar-Bar Change Na Ho)
+if "locked_nifty_trade" not in st.session_state:
+    st.session_state.locked_nifty_trade = None
+
 # ================= BLACK-SCHOLES IV & DELTA =================
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -81,7 +85,6 @@ def get_nifty_option_master():
     return current_opts, nearest_expiry.strftime('%d-%b-%Y'), days_to_exp
 
 def get_technical_and_fib(_smartApi):
-    """5-Min Candles se VWAP, Supertrend, RSI aur Auto-Fibonacci Levels nikalta hai"""
     try:
         to_date = datetime.now()
         from_date = to_date - timedelta(days=3)
@@ -100,30 +103,24 @@ def get_technical_and_fib(_smartApi):
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
 
-        # 1. RSI (14)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         rsi_val = int(round((100 - (100 / (1 + rs))).iloc[-1]))
 
-        # 2. Intraday VWAP & Day High/Low for Fibonacci
         df['date'] = pd.to_datetime(df['time']).dt.date
         today_df = df[df['date'] == df['date'].iloc[-1]].copy()
         today_df['tp'] = (today_df['high'] + today_df['low'] + today_df['close']) / 3
         vwap_val = int(round(today_df['tp'].expanding().mean().iloc[-1]))
 
-        # Day Swing High & Low (Last 75 candles / intraday range)
         swing_high = float(today_df['high'].max())
         swing_low = float(today_df['low'].min())
         diff = max(swing_high - swing_low, 20.0)
-
-        # Fibonacci Retracement Levels (from High to Low)
         fib_382 = int(round(swing_high - (0.382 * diff)))
         fib_500 = int(round(swing_high - (0.500 * diff)))
         fib_618 = int(round(swing_high - (0.618 * diff)))
 
-        # 3. Supertrend (10, 2)
         hl2 = (df['high'] + df['low']) / 2
         tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
         atr = tr.rolling(10).mean()
@@ -144,14 +141,8 @@ def get_technical_and_fib(_smartApi):
                     upperband.iloc[i] = upperband.iloc[i - 1]
 
         return {
-            "rsi": rsi_val,
-            "vwap": vwap_val,
-            "st_bullish": in_uptrend[-1],
-            "fib_382": fib_382,
-            "fib_500": fib_500,
-            "fib_618": fib_618,
-            "swing_high": int(round(swing_high)),
-            "swing_low": int(round(swing_low))
+            "rsi": rsi_val, "vwap": vwap_val, "st_bullish": in_uptrend[-1],
+            "fib_382": fib_382, "fib_500": fib_500, "fib_618": fib_618
         }
     except Exception:
         return None
@@ -168,13 +159,17 @@ def calculate_max_pain(strikes, ce_oi_map, pe_oi_map):
 
 # ================= MAIN LIVE APP =================
 def main():
-    st.title("📈 Nifty 50 Live Option Chain Pro (5-Factor + Fibonacci)")
+    st.title("📈 Nifty 50 Live Option Chain Pro")
 
-    col_t1, col_t2 = st.columns([2, 1])
+    col_t1, col_t2, col_t3 = st.columns([2, 1, 1])
     with col_t1:
-        auto_refresh = st.toggle("🔄 Auto-Refresh Live Data (Har 5 Sec)", value=True)
+        auto_refresh = st.toggle("🔄 Auto-Refresh Live LTP (5 Sec)", value=True)
     with col_t2:
         if st.button("Refresh Now"):
+            st.rerun()
+    with col_t3:
+        if st.button("🔓 Reset Locked Trade"):
+            st.session_state.locked_nifty_trade = None
             st.rerun()
 
     smartApi = get_smartapi_session()
@@ -191,7 +186,11 @@ def main():
 
     spot_ltp = int(round(float(spot_res["data"]["ltp"])))
     atm_strike = int(round(spot_ltp / 50) * 50)
-    strikes = [atm_strike + (i * 50) for i in range(-8, 9)]
+
+    # Agar koi trade locked hai toh uski strike bhi chain me zaroor rakhein
+    locked = st.session_state.locked_nifty_trade
+    center_k = locked["strike"] if locked else atm_strike
+    strikes = [center_k + (i * 50) for i in range(-8, 9)]
 
     sub = opts_df[opts_df['strike_price'].isin(strikes)]
     tokens = sub['token'].tolist()
@@ -229,7 +228,6 @@ def main():
     tot_ce_oi, tot_pe_oi = sum(ce_ois.values()), sum(pe_ois.values())
     pcr_val = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 1.0
 
-    # Technical Indicators + Auto Fibonacci
     tech = get_technical_and_fib(smartApi)
     vwap_val = int(tech["vwap"]) if tech else spot_ltp
     rsi_val = int(tech["rsi"]) if tech else 50
@@ -238,69 +236,84 @@ def main():
     fib_500 = int(tech["fib_500"]) if tech else spot_ltp
     fib_618 = int(tech["fib_618"]) if tech else spot_ltp - 30
 
-    # ================= 5-FACTOR SIGNAL SCORING (VWAP + ST + RSI + PCR + FIBONACCI) =================
     bull_score, bear_score = 0, 0
-
-    # 1. VWAP
     if spot_ltp > vwap_val: bull_score += 1
     elif spot_ltp < vwap_val: bear_score += 1
-
-    # 2. Supertrend
     if st_bullish: bull_score += 1
     else: bear_score += 1
-
-    # 3. RSI
     if rsi_val > 55: bull_score += 1
     elif rsi_val < 45: bear_score += 1
-
-    # 4. PCR
     if pcr_val >= 1.10: bull_score += 1
     elif pcr_val <= 0.85: bear_score += 1
+    if spot_ltp >= fib_500: bull_score += 1
+    elif spot_ltp <= fib_618: bear_score += 1
 
-    # 5. Fibonacci Golden Zone (0.50 & 0.618)
-    if spot_ltp >= fib_500:
-        bull_score += 1
-        fib_status = f"Above Fib 0.50 ({fib_500})"
-    elif spot_ltp <= fib_618:
-        bear_score += 1
-        fib_status = f"Below Fib 0.618 ({fib_618})"
+    basis_txt = f"VWAP: {vwap_val} | ST: {'UP' if st_bullish else 'DOWN'} | RSI: {rsi_val} | PCR: {pcr_val} | Fib 0.50: {fib_500}"
+
+    # ================= LOCKED ENTRY & SEPARATE LIVE LTP LOGIC =================
+    if locked is not None:
+        # Pehle se lock kiye hue trade ka sirf LIVE LTP update karein (Entry/SL/Exit fixed rahenge)
+        live_opt_ltp = int(chain[locked["strike"]][locked["side"]].get("ltp", locked["entry"]))
+        pts_diff = live_opt_ltp - locked["entry"]
+        pts_str = f"+{pts_diff}" if pts_diff >= 0 else f"{pts_diff}"
+
+        # Check agar SL ya Final Exit 2 hit ho gaya ho
+        if live_opt_ltp <= locked["sl"]:
+            box_class = "bearish"
+            dir_title = f"❌ STOP LOSS HIT — {locked['strike']} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  |  SL: ₹{locked['sl']}"
+            st.session_state.locked_nifty_trade = None
+        elif live_opt_ltp >= locked["exit2"]:
+            box_class = "bullish"
+            dir_title = f"🎯 FINAL TARGET 2 HIT — {locked['strike']} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  |  EXIT 2: ₹{locked['exit2']}"
+            st.session_state.locked_nifty_trade = None
+        else:
+            box_class = "bullish" if locked["side"] == "CE" else "bearish"
+            status_tag = "EXIT 1 CROSSED (Trail SL to Entry!)" if live_opt_ltp >= locked["exit1"] else "TRADE ACTIVE"
+            dir_title = f"🔒 {status_tag} — BUY {locked['strike']} {locked['side']} (Locked @ {locked['time']})"
+            action_msg = (
+                f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  ||  "
+                f"SL: ₹{locked['sl']}  |  EXIT 1: ₹{locked['exit1']}  |  EXIT 2: ₹{locked['exit2']}"
+            )
     else:
-        fib_status = f"Golden Zone ({fib_618}-{fib_500})"
+        # Naya Signal Check karein aur milte hi LOCK kar dein
+        if bull_score >= 4:
+            rec_ltp = int(chain[atm_strike]["CE"].get("ltp", 0))
+            _, rec_delta = calc_iv_and_delta(spot_ltp, atm_strike, days_to_exp, rec_ltp, "CE")
+            d = max(abs(rec_delta), 0.45)
+            risk_pts = max(int(round(rec_ltp * 0.15)), int(round(20 * d)))
+            sl = max(rec_ltp - risk_pts, 5)
+            tgt1 = int(round(rec_ltp + (risk_pts * 1.5)))
+            tgt2 = int(round(rec_ltp + max((major_eor - spot_ltp) * d, risk_pts * 2.5)))
 
-    basis_txt = f"VWAP: {vwap_val} | ST: {'UP' if st_bullish else 'DOWN'} | RSI: {rsi_val} | PCR: {pcr_val} | Fib: {fib_status}"
+            st.session_state.locked_nifty_trade = {
+                "side": "CE", "strike": atm_strike, "entry": rec_ltp,
+                "sl": sl, "exit1": tgt1, "exit2": tgt2,
+                "time": datetime.now().strftime("%H:%M")
+            }
+            st.rerun()
 
-    # ================= ACCURATE ENTRY & 2-STAGE EXIT LOGIC =================
-    if bull_score >= 4:
-        box_class = "bullish"
-        dir_title = f"🟢 STRONG BULLISH — MARKET UPAR JAYEGA ({bull_score}/5 Confirmations)"
-        rec_ltp = int(chain[atm_strike]["CE"].get("ltp", 0))
-        _, rec_delta = calc_iv_and_delta(spot_ltp, atm_strike, days_to_exp, rec_ltp, "CE")
-        d = max(abs(rec_delta), 0.45)
+        elif bear_score >= 4:
+            rec_ltp = int(chain[atm_strike]["PE"].get("ltp", 0))
+            _, rec_delta = calc_iv_and_delta(spot_ltp, atm_strike, days_to_exp, rec_ltp, "PE")
+            d = max(abs(rec_delta), 0.45)
+            risk_pts = max(int(round(rec_ltp * 0.15)), int(round(20 * d)))
+            sl = max(rec_ltp - risk_pts, 5)
+            tgt1 = int(round(rec_ltp + (risk_pts * 1.5)))
+            tgt2 = int(round(rec_ltp + max((spot_ltp - major_eos) * d, risk_pts * 2.5)))
 
-        # Strict Risk:Reward Entry, SL & 2 Exits
-        risk_pts = max(int(round(rec_ltp * 0.15)), int(round(20 * d)))
-        sl = max(rec_ltp - risk_pts, 5)
-        tgt1 = int(round(rec_ltp + (risk_pts * 1.5))) # Safe Exit 1 (50% Book + Trail SL to Entry)
-        tgt2 = int(round(rec_ltp + max((major_eor - spot_ltp) * d, risk_pts * 2.5))) # Final Exit 2
+            st.session_state.locked_nifty_trade = {
+                "side": "PE", "strike": atm_strike, "entry": rec_ltp,
+                "sl": sl, "exit1": tgt1, "exit2": tgt2,
+                "time": datetime.now().strftime("%H:%M")
+            }
+            st.rerun()
 
-        action_msg = f"ENTRY: BUY {atm_strike} CE @ ₹{rec_ltp}  |  SL: ₹{sl}  |  EXIT 1: ₹{tgt1} (50% Book)  |  EXIT 2: ₹{tgt2}"
-    elif bear_score >= 4:
-        box_class = "bearish"
-        dir_title = f"🔴 STRONG BEARISH — MARKET NEECHE JAYEGA ({bear_score}/5 Confirmations)"
-        rec_ltp = int(chain[atm_strike]["PE"].get("ltp", 0))
-        _, rec_delta = calc_iv_and_delta(spot_ltp, atm_strike, days_to_exp, rec_ltp, "PE")
-        d = max(abs(rec_delta), 0.45)
-
-        risk_pts = max(int(round(rec_ltp * 0.15)), int(round(20 * d)))
-        sl = max(rec_ltp - risk_pts, 5)
-        tgt1 = int(round(rec_ltp + (risk_pts * 1.5)))
-        tgt2 = int(round(rec_ltp + max((spot_ltp - major_eos) * d, risk_pts * 2.5)))
-
-        action_msg = f"ENTRY: BUY {atm_strike} PE @ ₹{rec_ltp}  |  SL: ₹{sl}  |  EXIT 1: ₹{tgt1} (50% Book)  |  EXIT 2: ₹{tgt2}"
-    else:
-        box_class = "neutral"
-        dir_title = f"🟡 NO TRADE / WAIT (Bull: {bull_score}/5 | Bear: {bear_score}/5)"
-        action_msg = f"Clear Entry ke liye Fib 0.382 ({fib_382}) ke upar CE ya Fib 0.618 ({fib_618}) ke neeche PE ka wait karein"
+        else:
+            box_class = "neutral"
+            dir_title = f"🟡 NO TRADE / WAIT (Bull: {bull_score}/5 | Bear: {bear_score}/5)"
+            action_msg = f"Clear Entry ke liye Fib 0.382 ({fib_382}) ke upar CE ya Fib 0.618 ({fib_618}) ke neeche PE ka wait karein"
 
     st.markdown(f"""
     <div class="decision-box {box_class}">
@@ -310,7 +323,6 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Top Key Metrics Row (Whole Numbers)
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Nifty Spot", f"{spot_ltp}")
     m2.metric("VWAP / RSI", f"{vwap_val} / {rsi_val}")
@@ -319,7 +331,7 @@ def main():
     m5.metric("Support (EOS)", f"{max_pe_oi_k} ({major_eos})")
     m6.metric("PCR / Max Pain", f"{pcr_val} / {max_pain_k}")
 
-    # ================= OPTION CHAIN MATRIX TABLE (WHOLE NUMBERS) =================
+    # ================= OPTION CHAIN MATRIX TABLE (LIVE LTP ALAG DIKHEGA) =================
     table_rows = []
     for k in strikes:
         ce, pe = chain[k]["CE"], chain[k]["PE"]
@@ -339,14 +351,12 @@ def main():
             "CE Vol": ce_vol,
             "CE SL": max(ce_ltp - ce_risk, 5),
             "CE Exit1": int(round(ce_ltp + ce_risk * 1.5)),
-            "CE Exit2": int(round(ce_ltp + max((major_eor - spot_ltp) * d_ce, ce_risk * 2.5))),
-            "CE LTP": ce_ltp,
+            "CE Live LTP": ce_ltp,
             "EOR": int(round(k + ce_ltp)),
             "STRIKE": f"👉 {k}" if k == atm_strike else f"{k}",
             "EOS": int(round(k - pe_ltp)),
-            "PE LTP": pe_ltp,
+            "PE Live LTP": pe_ltp,
             "PE Exit1": int(round(pe_ltp + pe_risk * 1.5)),
-            "PE Exit2": int(round(pe_ltp + max((spot_ltp - major_eos) * d_pe, pe_risk * 2.5))),
             "PE SL": max(pe_ltp - pe_risk, 5),
             "PE Vol": pe_vol,
             "PE OI": pe_oi,
@@ -358,28 +368,28 @@ def main():
     def highlight_matrix(row):
         styles = [''] * len(row)
         strike_num = int(str(row["STRIKE"]).replace("👉 ", ""))
-        styles[8] = 'background-color: #0f243e; color: white; font-weight: bold;'
+        styles[7] = 'background-color: #0f243e; color: white; font-weight: bold;'
         if strike_num == atm_strike:
             styles = ['background-color: #fff200; color: black; font-weight: bold;'] * len(row)
-            styles[8] = 'background-color: #000000; color: #fff200; font-weight: bold;'
+            styles[7] = 'background-color: #000000; color: #fff200; font-weight: bold;'
         else:
             if strike_num < spot_ltp:
-                styles[6] = 'background-color: #ffcccc; color: black;'
+                styles[5] = 'background-color: #ffcccc; color: black;'
             else:
-                styles[10] = 'background-color: #ccffcc; color: black;'
+                styles[9] = 'background-color: #ccffcc; color: black;'
             if strike_num == max_ce_oi_k:
                 styles[1] = 'background-color: #ffe600; color: black; font-weight: bold;'
             if strike_num == max_pe_oi_k:
-                styles[15] = 'background-color: #00e673; color: black; font-weight: bold;'
+                styles[13] = 'background-color: #00e673; color: black; font-weight: bold;'
         return styles
 
     styled_df = df_chain.style.apply(highlight_matrix, axis=1).format({
-        "CE OI": "{:,d}", "CE Vol": "{:,d}", "CE SL": "{:d}", "CE Exit1": "{:d}", "CE Exit2": "{:d}",
-        "CE LTP": "{:d}", "EOR": "{:d}", "EOS": "{:d}", "PE LTP": "{:d}", "PE Exit1": "{:d}",
-        "PE Exit2": "{:d}", "PE SL": "{:d}", "PE Vol": "{:,d}", "PE OI": "{:,d}"
+        "CE OI": "{:,d}", "CE Vol": "{:,d}", "CE SL": "{:d}", "CE Exit1": "{:d}",
+        "CE Live LTP": "{:d}", "EOR": "{:d}", "EOS": "{:d}", "PE Live LTP": "{:d}",
+        "PE Exit1": "{:d}", "PE SL": "{:d}", "PE Vol": "{:,d}", "PE OI": "{:,d}"
     })
 
-    st.dataframe(styled_df, use_container_width=True, height=640, hide_index=True)
+    st.dataframe(styled_df, use_container_width=True, height=620, hide_index=True)
     st.caption(f"Expiry: {expiry_str} | Updated: {datetime.now().strftime('%H:%M:%S')} IST")
 
     if auto_refresh:
