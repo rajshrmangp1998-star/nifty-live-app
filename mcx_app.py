@@ -32,6 +32,10 @@ CLIENT_CODE = st.secrets.get("CLIENT_CODE", "AAAA317311")
 PASSWORD = st.secrets.get("PASSWORD", "7047")
 TOTP_SECRET = st.secrets.get("TOTP_SECRET", "IW4DZWTJ2CAMBGMP2A7WOTLRNI")
 
+# Session State for Locked MCX Trade
+if "locked_mcx_trade" not in st.session_state:
+    st.session_state.locked_mcx_trade = {"CRUDEOIL": None, "NATURALGAS": None}
+
 # ================= BLACK-SCHOLES IV & DELTA =================
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -75,11 +79,9 @@ def get_mcx_master(commodity_name):
     mcx_df['expiry_dt'] = pd.to_datetime(mcx_df['expiry'], format='%d%b%Y')
     today = pd.Timestamp.today().normalize()
 
-    # Nearest Future Contract (Spot/Future Reference ke liye)
     futs = mcx_df[(mcx_df['instrumenttype'] == 'FUTCOM') & (mcx_df['expiry_dt'] >= today)].sort_values('expiry_dt')
     nearest_fut = futs.iloc[0]
 
-    # Nearest Option Chain Contracts
     opts = mcx_df[(mcx_df['instrumenttype'] == 'OPTFUT') & (mcx_df['expiry_dt'] >= today)].copy()
     nearest_opt_exp = opts['expiry_dt'].min()
     current_opts = opts[opts['expiry_dt'] == nearest_opt_exp].copy()
@@ -107,14 +109,12 @@ def get_mcx_technicals(_smartApi, fut_token):
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
 
-        # RSI (14)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         rsi_val = int(round((100 - (100 / (1 + rs))).iloc[-1]))
 
-        # Intraday VWAP & Fibonacci
         df['date'] = pd.to_datetime(df['time']).dt.date
         today_df = df[df['date'] == df['date'].iloc[-1]].copy()
         today_df['tp'] = (today_df['high'] + today_df['low'] + today_df['close']) / 3
@@ -127,7 +127,6 @@ def get_mcx_technicals(_smartApi, fut_token):
         fib_500 = round(swing_high - (0.500 * diff), 1)
         fib_618 = round(swing_high - (0.618 * diff), 1)
 
-        # Supertrend (10, 2)
         hl2 = (df['high'] + df['low']) / 2
         tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
         atr = tr.rolling(10).mean()
@@ -158,13 +157,17 @@ def get_mcx_technicals(_smartApi, fut_token):
 def main():
     st.title("🛢️ MCX Live Option Chain Pro (Crude Oil & Natural Gas)")
 
-    c1, c2, c3 = st.columns([2, 2, 1])
+    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
     with c1:
         commodity = st.selectbox("Commodity Chunein:", ["CRUDEOIL", "NATURALGAS"])
     with c2:
-        auto_refresh = st.toggle("🔄 Auto-Refresh Live Data (Har 5 Sec)", value=True)
+        auto_refresh = st.toggle("🔄 Auto-Refresh Live LTP (5 Sec)", value=True)
     with c3:
         if st.button("Refresh Now"):
+            st.rerun()
+    with c4:
+        if st.button("🔓 Reset Trade"):
+            st.session_state.locked_mcx_trade[commodity] = None
             st.rerun()
 
     step = 50 if commodity == "CRUDEOIL" else 5
@@ -189,7 +192,9 @@ def main():
     if not is_ng:
         atm_strike = int(atm_strike)
 
-    strikes = [round(atm_strike + (i * step), 1) if is_ng else int(atm_strike + (i * step)) for i in range(-7, 8)]
+    locked = st.session_state.locked_mcx_trade[commodity]
+    center_k = locked["strike"] if locked else atm_strike
+    strikes = [round(center_k + (i * step), 1) if is_ng else int(center_k + (i * step)) for i in range(-7, 8)]
 
     sub = opts_df[opts_df['strike_price'].isin(strikes)]
     tokens = sub['token'].tolist()
@@ -235,7 +240,6 @@ def main():
     fib_500 = (tech["fib_500"] if is_ng else int(round(tech["fib_500"]))) if tech else fut_ltp
     fib_618 = (tech["fib_618"] if is_ng else int(round(tech["fib_618"]))) if tech else fut_ltp
 
-    # ================= 5-FACTOR SIGNAL SCORING =================
     bull_score, bear_score = 0, 0
     if fut_ltp > vwap_val: bull_score += 1
     elif fut_ltp < vwap_val: bear_score += 1
@@ -250,26 +254,61 @@ def main():
 
     basis_txt = f"VWAP: {vwap_val} | ST: {'UP' if st_bullish else 'DOWN'} | RSI: {rsi_val} | PCR: {pcr_val} | Fib 0.50: {fib_500}"
 
-    if bull_score >= 4:
-        box_class = "bullish"
-        dir_title = f"🟢 {commodity} BULLISH — UPAR JAYEGA ({bull_score}/5 Confirmations)"
-        rec_ltp = chain[atm_strike]["CE"].get("ltp", 0)
-        sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
-        tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
-        tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
-        action_msg = f"ENTRY: BUY {atm_strike} CE @ ₹{rec_ltp}  |  SL: ₹{sl}  |  EXIT 1: ₹{tgt1}  |  EXIT 2: ₹{tgt2}"
-    elif bear_score >= 4:
-        box_class = "bearish"
-        dir_title = f"🔴 {commodity} BEARISH — NEECHE JAYEGA ({bear_score}/5 Confirmations)"
-        rec_ltp = chain[atm_strike]["PE"].get("ltp", 0)
-        sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
-        tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
-        tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
-        action_msg = f"ENTRY: BUY {atm_strike} PE @ ₹{rec_ltp}  |  SL: ₹{sl}  |  EXIT 1: ₹{tgt1}  |  EXIT 2: ₹{tgt2}"
+    # ================= LOCKED ENTRY & SEPARATE LIVE LTP LOGIC =================
+    if locked is not None:
+        live_opt_ltp = chain[locked["strike"]][locked["side"]].get("ltp", locked["entry"])
+        pts_diff = round(live_opt_ltp - locked["entry"], 1) if is_ng else int(live_opt_ltp - locked["entry"])
+        pts_str = f"+{pts_diff}" if pts_diff >= 0 else f"{pts_diff}"
+
+        if live_opt_ltp <= locked["sl"]:
+            box_class = "bearish"
+            dir_title = f"❌ {commodity} STOP LOSS HIT — {locked['strike']} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  |  SL: ₹{locked['sl']}"
+            st.session_state.locked_mcx_trade[commodity] = None
+        elif live_opt_ltp >= locked["exit2"]:
+            box_class = "bullish"
+            dir_title = f"🎯 {commodity} FINAL TARGET 2 HIT — {locked['strike']} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  |  EXIT 2: ₹{locked['exit2']}"
+            st.session_state.locked_mcx_trade[commodity] = None
+        else:
+            box_class = "bullish" if locked["side"] == "CE" else "bearish"
+            status_tag = "EXIT 1 CROSSED (Trail SL to Entry!)" if live_opt_ltp >= locked["exit1"] else "TRADE ACTIVE"
+            dir_title = f"🔒 {commodity} {status_tag} — BUY {locked['strike']} {locked['side']} (Locked @ {locked['time']})"
+            action_msg = (
+                f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  ||  "
+                f"SL: ₹{locked['sl']}  |  EXIT 1: ₹{locked['exit1']}  |  EXIT 2: ₹{locked['exit2']}"
+            )
     else:
-        box_class = "neutral"
-        dir_title = f"🟡 {commodity} SIDEWAYS / WAIT (Bull: {bull_score}/5 | Bear: {bear_score}/5)"
-        action_msg = f"Breakout ka wait karein: Above {major_eor} (CE) ya Below {major_eos} (PE)"
+        if bull_score >= 4:
+            rec_ltp = chain[atm_strike]["CE"].get("ltp", 0)
+            sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
+            tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
+            tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
+
+            st.session_state.locked_mcx_trade[commodity] = {
+                "side": "CE", "strike": atm_strike, "entry": rec_ltp,
+                "sl": sl, "exit1": tgt1, "exit2": tgt2,
+                "time": datetime.now().strftime("%H:%M")
+            }
+            st.rerun()
+
+        elif bear_score >= 4:
+            rec_ltp = chain[atm_strike]["PE"].get("ltp", 0)
+            sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
+            tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
+            tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
+
+            st.session_state.locked_mcx_trade[commodity] = {
+                "side": "PE", "strike": atm_strike, "entry": rec_ltp,
+                "sl": sl, "exit1": tgt1, "exit2": tgt2,
+                "time": datetime.now().strftime("%H:%M")
+            }
+            st.rerun()
+
+        else:
+            box_class = "neutral"
+            dir_title = f"🟡 {commodity} SIDEWAYS / WAIT (Bull: {bull_score}/5 | Bear: {bear_score}/5)"
+            action_msg = f"Breakout ka wait karein: Above {major_eor} (CE) ya Below {major_eos} (PE)"
 
     st.markdown(f"""
     <div class="decision-box {box_class}">
@@ -300,11 +339,11 @@ def main():
             "CE Vol": ce_vol,
             "CE SL": round(ce_ltp * 0.85, 1) if is_ng else int(round(ce_ltp * 0.85)),
             "CE Exit1": round(ce_ltp * 1.22, 1) if is_ng else int(round(ce_ltp * 1.22)),
-            "CE LTP": ce_ltp,
+            "CE Live LTP": ce_ltp,
             "EOR": round(k + ce_ltp, 1) if is_ng else int(round(k + ce_ltp)),
             "STRIKE": f"👉 {k}" if k == atm_strike else f"{k}",
             "EOS": round(k - pe_ltp, 1) if is_ng else int(round(k - pe_ltp)),
-            "PE LTP": pe_ltp,
+            "PE Live LTP": pe_ltp,
             "PE Exit1": round(pe_ltp * 1.22, 1) if is_ng else int(round(pe_ltp * 1.22)),
             "PE SL": round(pe_ltp * 0.85, 1) if is_ng else int(round(pe_ltp * 0.85)),
             "PE Vol": pe_vol,
