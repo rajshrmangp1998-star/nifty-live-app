@@ -49,13 +49,16 @@ def bs_price(S, K, T, r, sigma, opt_type):
         return max(0.0, S - K) if opt_type == "CE" else max(0.0, K - S)
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
-    return (S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)) if opt_type == "CE" else (K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1))
+    if opt_type == "CE":
+        return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+    return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
 
 def calc_iv_and_delta(S, K, T_days, market_price, opt_type):
     T = max(T_days, 0.25) / 365.0
     r = 0.07
     if market_price <= 0.2:
-        return 0, (1.0 if (opt_type == "CE" and S > K) else (-1.0 if (opt_type == "PE" and S < K) else 0.0))
+        d_fallback = 1.0 if (opt_type == "CE" and S > K) else (-1.0 if (opt_type == "PE" and S < K) else 0.0)
+        return 0, d_fallback
     low, high, iv = 0.01, 3.5, 0.25
     for _ in range(20):
         iv = (low + high) / 2.0
@@ -115,20 +118,17 @@ def get_mcx_technicals(_smartApi, fut_token, include_old_swings=True):
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
 
-        # RSI (14)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         rsi_val = int(round((100 - (100 / (1 + rs))).iloc[-1]))
 
-        # Intraday VWAP (Today only)
         df['date'] = pd.to_datetime(df['time']).dt.date
         today_df = df[df['date'] == df['date'].iloc[-1]].copy()
         today_df['tp'] = (today_df['high'] + today_df['low'] + today_df['close']) / 3
         vwap_val = round(today_df['tp'].expanding().mean().iloc[-1], 1)
 
-        # Fibonacci Swing High & Low (Old Swings + Today vs Today Only)
         swing_df = df.tail(250) if include_old_swings else today_df
         swing_high = float(swing_df['high'].max())
         swing_low = float(swing_df['low'].min())
@@ -137,9 +137,12 @@ def get_mcx_technicals(_smartApi, fut_token, include_old_swings=True):
         fib_500 = round(swing_high - (0.500 * diff), 1)
         fib_618 = round(swing_high - (0.618 * diff), 1)
 
-        # Supertrend (10, 2)
         hl2 = (df['high'] + df['low']) / 2
-        tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift()).abs(),
+            (df['low'] - df['close'].shift()).abs()
+        ], axis=1).max(axis=1)
         atr = tr.rolling(10).mean()
         upperband = hl2 + (2.0 * atr)
         lowerband = hl2 - (2.0 * atr)
@@ -279,19 +282,145 @@ def main():
     elif fut_ltp <= fib_618: bear_score += 1
 
     fib_mode = "Old+Today" if use_old_swings else "Today"
-    basis_txt = f"VWAP: {fmt_num(vwap_val)} | ST: {'UP' if st_bullish else 'DOWN'} | RSI: {rsi_val} | PCR: {pcr_val:.1f} | Fib({fib_mode}) 0.5: {fmt_num(fib_500)}"
+    basis_txt = (
+        f"VWAP: {fmt_num(vwap_val)} | ST: {'UP' if st_bullish else 'DOWN'} | "
+        f"RSI: {rsi_val} | PCR: {pcr_val:.1f} | Fib({fib_mode}) 0.5: {fmt_num(fib_500)}"
+    )
 
     # ================= LOCKED ENTRY & SEPARATE LIVE LTP =================
     if locked is not None:
         live_opt_ltp = chain[locked["strike"]][locked["side"]].get("ltp", locked["entry"])
         pts_diff = round(live_opt_ltp - locked["entry"], 1) if is_ng else int(live_opt_ltp - locked["entry"])
         pts_str = f"+{fmt_num(pts_diff)}" if pts_diff >= 0 else f"{fmt_num(pts_diff)}"
+        s_str = fmt_num(locked['strike'])
+        e_str = fmt_num(locked['entry'])
+        l_str = fmt_num(live_opt_ltp)
 
         if live_opt_ltp <= locked["sl"]:
             box_class = "bearish"
-            dir_title = f"❌ {commodity} STOP LOSS HIT — {fmt_num(locked['strike'])} {locked['side']} (Auto-Unlocking)"
-            action_msg = f"FIXED ENTRY: ₹{fmt_num(locked['entry'])}  |  LIVE LTP: ₹{fmt_num(live_opt_ltp)} ({pts_str} pts)  |  SL: ₹{fmt_num(locked['sl'])}"
+            dir_title = f"❌ {commodity} SL HIT — {s_str} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{e_str} | LIVE LTP: ₹{l_str} ({pts_str} pts) | SL: ₹{fmt_num(locked['sl'])}"
             st.session_state.locked_mcx_trade[commodity] = None
         elif live_opt_ltp >= locked["exit2"]:
             box_class = "bullish"
-           dir_title = f"🎯 {commodity} FINAL TARGET 2 HIT — {fmt_num(locked['strike'])} {locked['side']} (Auto-Unlocking)"
+            dir_title = f"🎯 {commodity} TARGET 2 HIT — {s_str} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{e_str} | LIVE LTP: ₹{l_str} ({pts_str} pts) | EXIT 2: ₹{fmt_num(locked['exit2'])}"
+            st.session_state.locked_mcx_trade[commodity] = None
+        else:
+            box_class = "bullish" if locked["side"] == "CE" else "bearish"
+            status_tag = "EXIT 1 CROSSED (Trail SL to Entry!)" if live_opt_ltp >= locked["exit1"] else "TRADE ACTIVE"
+            dir_title = f"🔒 {commodity} {status_tag} — BUY {s_str} {locked['side']} (Locked @ {locked['time']} IST)"
+            action_msg = (
+                f"FIXED ENTRY: ₹{e_str} | LIVE LTP: ₹{l_str} ({pts_str} pts) || "
+                f"SL: ₹{fmt_num(locked['sl'])} | EXIT 1: ₹{fmt_num(locked['exit1'])} | EXIT 2: ₹{fmt_num(locked['exit2'])}"
+            )
+    else:
+        if bull_score >= 4:
+            rec_ltp = chain[atm_strike]["CE"].get("ltp", 0)
+            sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
+            tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
+            tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
+
+            st.session_state.locked_mcx_trade[commodity] = {
+                "side": "CE", "strike": atm_strike, "entry": rec_ltp,
+                "sl": sl, "exit1": tgt1, "exit2": tgt2,
+                "time": get_ist_now().strftime("%H:%M")
+            }
+            st.rerun()
+
+        elif bear_score >= 4:
+            rec_ltp = chain[atm_strike]["PE"].get("ltp", 0)
+            sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
+            tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
+            tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
+
+            st.session_state.locked_mcx_trade[commodity] = {
+                "side": "PE", "strike": atm_strike, "entry": rec_ltp,
+                "sl": sl, "exit1": tgt1, "exit2": tgt2,
+                "time": get_ist_now().strftime("%H:%M")
+            }
+            st.rerun()
+
+        else:
+            box_class = "neutral"
+            dir_title = f"🟡 {commodity} SIDEWAYS / WAIT (Bull: {bull_score}/5 | Bear: {bear_score}/5)"
+            action_msg = f"Breakout ka wait karein: Above {fmt_num(major_eor)} (CE) ya Below {fmt_num(major_eos)} (PE)"
+
+    st.markdown(f"""
+    <div class="decision-box {box_class}">
+        <div style="font-size: 18px;">{dir_title}</div>
+        <div style="font-size: 16px; margin-top: 6px;">{action_msg}</div>
+        <div style="font-size: 12px; margin-top: 5px; opacity: 0.9;">{basis_txt}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric(f"{commodity} Future", fmt_num(fut_ltp))
+    m2.metric("VWAP / RSI", f"{fmt_num(vwap_val)} / {rsi_val}")
+    m3.metric("Intraday Res (EOR)", f"{fmt_num(max_ce_oi_k)} ({fmt_num(major_eor)})")
+    m4.metric("Intraday Sup (EOS)", f"{fmt_num(max_pe_oi_k)} ({fmt_num(major_eos)})")
+    m5.metric("PCR (OI)", f"{pcr_val:.1f}")
+
+    table_rows = []
+    for k in strikes:
+        ce, pe = chain[k]["CE"], chain[k]["PE"]
+        ce_ltp, ce_oi, ce_vol = ce.get("ltp", 0), ce.get("oi", 0), ce.get("vol", 0)
+        pe_ltp, pe_oi, pe_vol = pe.get("ltp", 0), pe.get("oi", 0), pe.get("vol", 0)
+        ce_iv, ce_d = calc_iv_and_delta(fut_ltp, k, days_to_exp, ce_ltp, "CE")
+        pe_iv, pe_d = calc_iv_and_delta(fut_ltp, k, days_to_exp, pe_ltp, "PE")
+
+        table_rows.append({
+            "CE IV|Δ": f"{ce_iv}%|{ce_d:.1f}",
+            "CE OI": ce_oi,
+            "CE Vol": ce_vol,
+            "CE SL": round(ce_ltp * 0.85, 1) if is_ng else int(round(ce_ltp * 0.85)),
+            "CE Exit1": round(ce_ltp * 1.22, 1) if is_ng else int(round(ce_ltp * 1.22)),
+            "CE Live LTP": ce_ltp,
+            "EOR": round(k + ce_ltp, 1) if is_ng else int(round(k + ce_ltp)),
+            "STRIKE": f"👉 {fmt_num(k)}" if k == atm_strike else f"{fmt_num(k)}",
+            "EOS": round(k - pe_ltp, 1) if is_ng else int(round(k - pe_ltp)),
+            "PE Live LTP": pe_ltp,
+            "PE Exit1": round(pe_ltp * 1.22, 1) if is_ng else int(round(pe_ltp * 1.22)),
+            "PE SL": round(pe_ltp * 0.85, 1) if is_ng else int(round(pe_ltp * 0.85)),
+            "PE Vol": pe_vol,
+            "PE OI": pe_oi,
+            "PE IV|Δ": f"{pe_iv}%|{pe_d:.1f}"
+        })
+
+    df_chain = pd.DataFrame(table_rows)
+
+    def highlight_matrix(row):
+        styles = [''] * len(row)
+        strike_val = float(str(row["STRIKE"]).replace("👉 ", ""))
+        styles[7] = 'background-color: #0f243e; color: white; font-weight: bold;'
+        if strike_val == atm_strike:
+            styles = ['background-color: #fff200; color: black; font-weight: bold;'] * len(row)
+            styles[7] = 'background-color: #000000; color: #fff200; font-weight: bold;'
+        else:
+            if strike_val < fut_ltp:
+                styles[5] = 'background-color: #ffcccc; color: black;'
+            else:
+                styles[9] = 'background-color: #ccffcc; color: black;'
+            if strike_val == max_ce_oi_k:
+                styles[1] = 'background-color: #ffe600; color: black; font-weight: bold;'
+            if strike_val == max_pe_oi_k:
+                styles[13] = 'background-color: #00e673; color: black; font-weight: bold;'
+        return styles
+
+    price_fmt = "{:.1f}" if is_ng else "{:d}"
+    styled_df = df_chain.style.apply(highlight_matrix, axis=1).format({
+        "CE OI": "{:,d}", "CE Vol": "{:,d}",
+        "CE SL": price_fmt, "CE Exit1": price_fmt, "CE Live LTP": price_fmt, "EOR": price_fmt,
+        "EOS": price_fmt, "PE Live LTP": price_fmt, "PE Exit1": price_fmt, "PE SL": price_fmt,
+        "PE Vol": "{:,d}", "PE OI": "{:,d}"
+    })
+
+    st.dataframe(styled_df, use_container_width=True, height=400, hide_index=True)
+    st.caption(f"Future: {fut_symbol} | Option Expiry: {expiry_str} | Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+
+if __name__ == "__main__":
+    main()
