@@ -1,7 +1,7 @@
 import time
 import math
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 import pyotp
@@ -26,13 +26,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= CREDENTIALS =================
+# ================= CREDENTIALS & IST TIME =================
 API_KEY = st.secrets.get("API_KEY", "voT6BGPU")
 CLIENT_CODE = st.secrets.get("CLIENT_CODE", "AAAA317311")
 PASSWORD = st.secrets.get("PASSWORD", "7047")
 TOTP_SECRET = st.secrets.get("TOTP_SECRET", "IW4DZWTJ2CAMBGMP2A7WOTLRNI")
 
-# Session State for Locked MCX Trade
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    return datetime.now(IST)
+
 if "locked_mcx_trade" not in st.session_state:
     st.session_state.locked_mcx_trade = {"CRUDEOIL": None, "NATURALGAS": None}
 
@@ -61,7 +65,7 @@ def calc_iv_and_delta(S, K, T_days, market_price, opt_type):
             low = iv
     d1 = (math.log(S / K) + (r + 0.5 * iv ** 2) * T) / (iv * math.sqrt(T))
     delta = norm_cdf(d1) if opt_type == "CE" else (norm_cdf(d1) - 1.0)
-    return int(round(iv * 100)), round(delta, 2)
+    return int(round(iv * 100)), round(delta, 1)
 
 # ================= CACHED SESSION & MCX MASTER =================
 @st.cache_resource(ttl=14400)
@@ -79,21 +83,23 @@ def get_mcx_master(commodity_name):
     mcx_df['expiry_dt'] = pd.to_datetime(mcx_df['expiry'], format='%d%b%Y')
     today = pd.Timestamp.today().normalize()
 
-    futs = mcx_df[(mcx_df['instrumenttype'] == 'FUTCOM') & (mcx_df['expiry_dt'] >= today)].sort_values('expiry_dt')
-    nearest_fut = futs.iloc[0]
-
     opts = mcx_df[(mcx_df['instrumenttype'] == 'OPTFUT') & (mcx_df['expiry_dt'] >= today)].copy()
     nearest_opt_exp = opts['expiry_dt'].min()
     current_opts = opts[opts['expiry_dt'] == nearest_opt_exp].copy()
     current_opts['strike_price'] = (current_opts['strike'].astype(float) / 100.0)
     days_to_exp = max(1, (nearest_opt_exp - today).days)
 
+    futs = mcx_df[(mcx_df['instrumenttype'] == 'FUTCOM') & (mcx_df['expiry_dt'] >= nearest_opt_exp)].sort_values('expiry_dt')
+    if futs.empty:
+        futs = mcx_df[(mcx_df['instrumenttype'] == 'FUTCOM') & (mcx_df['expiry_dt'] >= today)].sort_values('expiry_dt')
+    nearest_fut = futs.iloc[0]
+
     return nearest_fut, current_opts, nearest_opt_exp.strftime('%d-%b-%Y'), days_to_exp
 
-def get_mcx_technicals(_smartApi, fut_token):
+def get_mcx_technicals(_smartApi, fut_token, include_old_swings=True):
     try:
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=3)
+        to_date = get_ist_now()
+        from_date = to_date - timedelta(days=4)
         params = {
             "exchange": "MCX",
             "symboltoken": str(fut_token),
@@ -109,24 +115,29 @@ def get_mcx_technicals(_smartApi, fut_token):
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
 
+        # RSI (14)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         rsi_val = int(round((100 - (100 / (1 + rs))).iloc[-1]))
 
+        # Intraday VWAP (Today only)
         df['date'] = pd.to_datetime(df['time']).dt.date
         today_df = df[df['date'] == df['date'].iloc[-1]].copy()
         today_df['tp'] = (today_df['high'] + today_df['low'] + today_df['close']) / 3
         vwap_val = round(today_df['tp'].expanding().mean().iloc[-1], 1)
 
-        swing_high = float(today_df['high'].max())
-        swing_low = float(today_df['low'].min())
+        # Fibonacci Swing High & Low (Old Swings + Today vs Today Only)
+        swing_df = df.tail(250) if include_old_swings else today_df
+        swing_high = float(swing_df['high'].max())
+        swing_low = float(swing_df['low'].min())
         diff = max(swing_high - swing_low, 1.0)
         fib_382 = round(swing_high - (0.382 * diff), 1)
         fib_500 = round(swing_high - (0.500 * diff), 1)
         fib_618 = round(swing_high - (0.618 * diff), 1)
 
+        # Supertrend (10, 2)
         hl2 = (df['high'] + df['low']) / 2
         tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
         atr = tr.rolling(10).mean()
@@ -155,23 +166,26 @@ def get_mcx_technicals(_smartApi, fut_token):
 
 # ================= MAIN APP =================
 def main():
-    st.title("🛢️ MCX Live Option Chain Pro (Crude Oil & Natural Gas)")
+    st.title("🛢️ MCX Live Option Chain Pro")
 
-    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([1.6, 1.6, 1.5, 1, 1])
     with c1:
-        commodity = st.selectbox("Commodity Chunein:", ["CRUDEOIL", "NATURALGAS"])
+        commodity = st.selectbox("Commodity:", ["NATURALGAS", "CRUDEOIL"])
     with c2:
-        auto_refresh = st.toggle("🔄 Auto-Refresh Live LTP (5 Sec)", value=True)
+        use_old_swings = st.toggle("📐 Include Old Swings (Fib)", value=True)
     with c3:
+        auto_refresh = st.toggle("🔄 Auto-Refresh (5s)", value=True)
+    with c4:
         if st.button("Refresh Now"):
             st.rerun()
-    with c4:
+    with c5:
         if st.button("🔓 Reset Trade"):
             st.session_state.locked_mcx_trade[commodity] = None
             st.rerun()
 
-    step = 50 if commodity == "CRUDEOIL" else 5
+    step = 2.5 if commodity == "NATURALGAS" else 50
     is_ng = (commodity == "NATURALGAS")
+    fmt_num = (lambda x: f"{float(x):.1f}") if is_ng else (lambda x: f"{int(round(float(x)))}")
 
     smartApi = get_smartapi_session()
     if not smartApi:
@@ -194,9 +208,16 @@ def main():
 
     locked = st.session_state.locked_mcx_trade[commodity]
     center_k = locked["strike"] if locked else atm_strike
-    strikes = [round(center_k + (i * step), 1) if is_ng else int(center_k + (i * step)) for i in range(-7, 8)]
+    strikes = [round(center_k + (i * step), 1) if is_ng else int(center_k + (i * step)) for i in range(-4, 5)]
 
     sub = opts_df[opts_df['strike_price'].isin(strikes)]
+    if is_ng and len(sub) < 6:
+        step = 5.0
+        atm_strike = round(fut_ltp / step) * step
+        center_k = locked["strike"] if locked else atm_strike
+        strikes = [round(center_k + (i * step), 1) for i in range(-3, 4)]
+        sub = opts_df[opts_df['strike_price'].isin(strikes)]
+
     tokens = sub['token'].tolist()
     token_map = dict(zip(sub['token'], zip(sub['strike_price'], sub['symbol'])))
 
@@ -222,23 +243,28 @@ def main():
             "vol": int(item.get("tradeVolume", 0))
         }
 
-    ce_ois = {k: chain[k]["CE"].get("oi", 0) for k in strikes}
-    pe_ois = {k: chain[k]["PE"].get("oi", 0) for k in strikes}
-    max_ce_oi_k = max(ce_ois, key=ce_ois.get)
-    max_pe_oi_k = max(pe_ois, key=pe_ois.get)
+    near_ce_strikes = [k for k in strikes if atm_strike <= k <= atm_strike + (3 * step)]
+    near_pe_strikes = [k for k in strikes if atm_strike - (3 * step) <= k <= atm_strike]
+
+    ce_strength = {k: (chain[k]["CE"].get("oi", 0) + chain[k]["CE"].get("vol", 0)) for k in near_ce_strikes} if near_ce_strikes else {atm_strike: 0}
+    pe_strength = {k: (chain[k]["PE"].get("oi", 0) + chain[k]["PE"].get("vol", 0)) for k in near_pe_strikes} if near_pe_strikes else {atm_strike: 0}
+
+    max_ce_oi_k = max(ce_strength, key=ce_strength.get)
+    max_pe_oi_k = max(pe_strength, key=pe_strength.get)
 
     major_eor = round(max_ce_oi_k + chain[max_ce_oi_k]["CE"].get("ltp", 0), 1) if is_ng else int(round(max_ce_oi_k + chain[max_ce_oi_k]["CE"].get("ltp", 0)))
     major_eos = round(max_pe_oi_k - chain[max_pe_oi_k]["PE"].get("ltp", 0), 1) if is_ng else int(round(max_pe_oi_k - chain[max_pe_oi_k]["PE"].get("ltp", 0)))
 
-    tot_ce_oi, tot_pe_oi = sum(ce_ois.values()), sum(pe_ois.values())
-    pcr_val = round(tot_pe_oi / tot_ce_oi, 2) if tot_ce_oi > 0 else 1.0
+    tot_ce_oi = sum(chain[k]["CE"].get("oi", 0) for k in strikes)
+    tot_pe_oi = sum(chain[k]["PE"].get("oi", 0) for k in strikes)
+    pcr_val = round(tot_pe_oi / tot_ce_oi, 1) if tot_ce_oi > 0 else 1.0
 
-    tech = get_mcx_technicals(smartApi, fut_token)
-    vwap_val = (tech["vwap"] if is_ng else int(round(tech["vwap"]))) if tech else fut_ltp
+    tech = get_mcx_technicals(smartApi, fut_token, include_old_swings=use_old_swings)
+    vwap_val = (round(tech["vwap"], 1) if is_ng else int(round(tech["vwap"]))) if tech else fut_ltp
     rsi_val = tech["rsi"] if tech else 50
     st_bullish = tech["st_bullish"] if tech else (fut_ltp >= vwap_val)
-    fib_500 = (tech["fib_500"] if is_ng else int(round(tech["fib_500"]))) if tech else fut_ltp
-    fib_618 = (tech["fib_618"] if is_ng else int(round(tech["fib_618"]))) if tech else fut_ltp
+    fib_500 = (round(tech["fib_500"], 1) if is_ng else int(round(tech["fib_500"]))) if tech else fut_ltp
+    fib_618 = (round(tech["fib_618"], 1) if is_ng else int(round(tech["fib_618"]))) if tech else fut_ltp
 
     bull_score, bear_score = 0, 0
     if fut_ltp > vwap_val: bull_score += 1
@@ -247,136 +273,25 @@ def main():
     else: bear_score += 1
     if rsi_val > 55: bull_score += 1
     elif rsi_val < 45: bear_score += 1
-    if pcr_val >= 1.10: bull_score += 1
-    elif pcr_val <= 0.85: bear_score += 1
+    if pcr_val >= 1.1: bull_score += 1
+    elif pcr_val <= 0.8: bear_score += 1
     if fut_ltp >= fib_500: bull_score += 1
     elif fut_ltp <= fib_618: bear_score += 1
 
-    basis_txt = f"VWAP: {vwap_val} | ST: {'UP' if st_bullish else 'DOWN'} | RSI: {rsi_val} | PCR: {pcr_val} | Fib 0.50: {fib_500}"
+    fib_mode = "Old+Today" if use_old_swings else "Today"
+    basis_txt = f"VWAP: {fmt_num(vwap_val)} | ST: {'UP' if st_bullish else 'DOWN'} | RSI: {rsi_val} | PCR: {pcr_val:.1f} | Fib({fib_mode}) 0.5: {fmt_num(fib_500)}"
 
-    # ================= LOCKED ENTRY & SEPARATE LIVE LTP LOGIC =================
+    # ================= LOCKED ENTRY & SEPARATE LIVE LTP =================
     if locked is not None:
         live_opt_ltp = chain[locked["strike"]][locked["side"]].get("ltp", locked["entry"])
         pts_diff = round(live_opt_ltp - locked["entry"], 1) if is_ng else int(live_opt_ltp - locked["entry"])
-        pts_str = f"+{pts_diff}" if pts_diff >= 0 else f"{pts_diff}"
+        pts_str = f"+{fmt_num(pts_diff)}" if pts_diff >= 0 else f"{fmt_num(pts_diff)}"
 
         if live_opt_ltp <= locked["sl"]:
             box_class = "bearish"
-            dir_title = f"❌ {commodity} STOP LOSS HIT — {locked['strike']} {locked['side']} (Auto-Unlocking)"
-            action_msg = f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  |  SL: ₹{locked['sl']}"
+            dir_title = f"❌ {commodity} STOP LOSS HIT — {fmt_num(locked['strike'])} {locked['side']} (Auto-Unlocking)"
+            action_msg = f"FIXED ENTRY: ₹{fmt_num(locked['entry'])}  |  LIVE LTP: ₹{fmt_num(live_opt_ltp)} ({pts_str} pts)  |  SL: ₹{fmt_num(locked['sl'])}"
             st.session_state.locked_mcx_trade[commodity] = None
         elif live_opt_ltp >= locked["exit2"]:
             box_class = "bullish"
-            dir_title = f"🎯 {commodity} FINAL TARGET 2 HIT — {locked['strike']} {locked['side']} (Auto-Unlocking)"
-            action_msg = f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  |  EXIT 2: ₹{locked['exit2']}"
-            st.session_state.locked_mcx_trade[commodity] = None
-        else:
-            box_class = "bullish" if locked["side"] == "CE" else "bearish"
-            status_tag = "EXIT 1 CROSSED (Trail SL to Entry!)" if live_opt_ltp >= locked["exit1"] else "TRADE ACTIVE"
-            dir_title = f"🔒 {commodity} {status_tag} — BUY {locked['strike']} {locked['side']} (Locked @ {locked['time']})"
-            action_msg = (
-                f"FIXED ENTRY: ₹{locked['entry']}  |  LIVE LTP: ₹{live_opt_ltp} ({pts_str} pts)  ||  "
-                f"SL: ₹{locked['sl']}  |  EXIT 1: ₹{locked['exit1']}  |  EXIT 2: ₹{locked['exit2']}"
-            )
-    else:
-        if bull_score >= 4:
-            rec_ltp = chain[atm_strike]["CE"].get("ltp", 0)
-            sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
-            tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
-            tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
-
-            st.session_state.locked_mcx_trade[commodity] = {
-                "side": "CE", "strike": atm_strike, "entry": rec_ltp,
-                "sl": sl, "exit1": tgt1, "exit2": tgt2,
-                "time": datetime.now().strftime("%H:%M")
-            }
-            st.rerun()
-
-        elif bear_score >= 4:
-            rec_ltp = chain[atm_strike]["PE"].get("ltp", 0)
-            sl = round(rec_ltp * 0.85, 1) if is_ng else int(round(rec_ltp * 0.85))
-            tgt1 = round(rec_ltp * 1.22, 1) if is_ng else int(round(rec_ltp * 1.22))
-            tgt2 = round(rec_ltp * 1.40, 1) if is_ng else int(round(rec_ltp * 1.40))
-
-            st.session_state.locked_mcx_trade[commodity] = {
-                "side": "PE", "strike": atm_strike, "entry": rec_ltp,
-                "sl": sl, "exit1": tgt1, "exit2": tgt2,
-                "time": datetime.now().strftime("%H:%M")
-            }
-            st.rerun()
-
-        else:
-            box_class = "neutral"
-            dir_title = f"🟡 {commodity} SIDEWAYS / WAIT (Bull: {bull_score}/5 | Bear: {bear_score}/5)"
-            action_msg = f"Breakout ka wait karein: Above {major_eor} (CE) ya Below {major_eos} (PE)"
-
-    st.markdown(f"""
-    <div class="decision-box {box_class}">
-        <div style="font-size: 18px;">{dir_title}</div>
-        <div style="font-size: 16px; margin-top: 6px;">{action_msg}</div>
-        <div style="font-size: 12px; margin-top: 5px; opacity: 0.9;">{basis_txt}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric(f"{commodity} Future", f"{fut_ltp}")
-    m2.metric("VWAP / RSI", f"{vwap_val} / {rsi_val}")
-    m3.metric("Resistance (EOR)", f"{max_ce_oi_k} ({major_eor})")
-    m4.metric("Support (EOS)", f"{max_pe_oi_k} ({major_eos})")
-    m5.metric("PCR (OI)", f"{pcr_val}")
-
-    table_rows = []
-    for k in strikes:
-        ce, pe = chain[k]["CE"], chain[k]["PE"]
-        ce_ltp, ce_oi, ce_vol = ce.get("ltp", 0), ce.get("oi", 0), ce.get("vol", 0)
-        pe_ltp, pe_oi, pe_vol = pe.get("ltp", 0), pe.get("oi", 0), pe.get("vol", 0)
-        ce_iv, ce_d = calc_iv_and_delta(fut_ltp, k, days_to_exp, ce_ltp, "CE")
-        pe_iv, pe_d = calc_iv_and_delta(fut_ltp, k, days_to_exp, pe_ltp, "PE")
-
-        table_rows.append({
-            "CE IV|Δ": f"{ce_iv}%|{ce_d}",
-            "CE OI": ce_oi,
-            "CE Vol": ce_vol,
-            "CE SL": round(ce_ltp * 0.85, 1) if is_ng else int(round(ce_ltp * 0.85)),
-            "CE Exit1": round(ce_ltp * 1.22, 1) if is_ng else int(round(ce_ltp * 1.22)),
-            "CE Live LTP": ce_ltp,
-            "EOR": round(k + ce_ltp, 1) if is_ng else int(round(k + ce_ltp)),
-            "STRIKE": f"👉 {k}" if k == atm_strike else f"{k}",
-            "EOS": round(k - pe_ltp, 1) if is_ng else int(round(k - pe_ltp)),
-            "PE Live LTP": pe_ltp,
-            "PE Exit1": round(pe_ltp * 1.22, 1) if is_ng else int(round(pe_ltp * 1.22)),
-            "PE SL": round(pe_ltp * 0.85, 1) if is_ng else int(round(pe_ltp * 0.85)),
-            "PE Vol": pe_vol,
-            "PE OI": pe_oi,
-            "PE IV|Δ": f"{pe_iv}%|{pe_d}"
-        })
-
-    df_chain = pd.DataFrame(table_rows)
-
-    def highlight_matrix(row):
-        styles = [''] * len(row)
-        strike_val = float(str(row["STRIKE"]).replace("👉 ", ""))
-        styles[7] = 'background-color: #0f243e; color: white; font-weight: bold;'
-        if strike_val == atm_strike:
-            styles = ['background-color: #fff200; color: black; font-weight: bold;'] * len(row)
-            styles[7] = 'background-color: #000000; color: #fff200; font-weight: bold;'
-        else:
-            if strike_val < fut_ltp:
-                styles[5] = 'background-color: #ffcccc; color: black;'
-            else:
-                styles[9] = 'background-color: #ccffcc; color: black;'
-            if strike_val == max_ce_oi_k:
-                styles[1] = 'background-color: #ffe600; color: black; font-weight: bold;'
-            if strike_val == max_pe_oi_k:
-                styles[13] = 'background-color: #00e673; color: black; font-weight: bold;'
-        return styles
-
-    st.dataframe(df_chain.style.apply(highlight_matrix, axis=1), use_container_width=True, height=580, hide_index=True)
-    st.caption(f"Future: {fut_symbol} | Option Expiry: {expiry_str} | Updated: {datetime.now().strftime('%H:%M:%S')} IST")
-
-    if auto_refresh:
-        time.sleep(5)
-        st.rerun()
-
-if __name__ == "__main__":
-    main()
+            dir_title = f"🎯 {commodity} FINAL TARGET
