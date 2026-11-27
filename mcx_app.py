@@ -294,4 +294,4 @@ def main():
             st.session_state.locked_mcx_trade[commodity] = None
         elif live_opt_ltp >= locked["exit2"]:
             box_class = "bullish"
-            dir_title = f"🎯 {commodity} FINAL TARGET
+           dir_title = f"🎯 {commodity} FINAL TARGET 2 HIT — {fmt_num(locked['strike'])} {locked['side']} (Auto-Unlocking)"
